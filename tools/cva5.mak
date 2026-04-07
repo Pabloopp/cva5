@@ -21,14 +21,14 @@ CFLAGS = -g0 -O3 -std=c++14 -march=native -DDETERMINISTIC=$(DETERMINISTIC)
 
 #Verilator
 ################################################################################
-VERILATOR_LINT_IGNORE= -Wno-LITENDIAN -Wno-SYMRSVDWORD
+VERILATOR_LINT_IGNORE= -Wno-LITENDIAN -Wno-SYMRSVDWORD -Wno-MULTIDRIVEN
 ifeq ($(TRACE_ENABLE), True)
 	VERILATOR_CFLAGS =  --trace-fst --trace-structs --CFLAGS "$(CFLAGS)  -D TRACE_ON"
 else
 	VERILATOR_CFLAGS =   --CFLAGS  "$(CFLAGS)"
 endif
 
-VERILATOR_LINT_IGNORE= -Wno-LITENDIAN -Wno-SYMRSVDWORD
+VERILATOR_LINT_IGNORE= -Wno-LITENDIAN -Wno-SYMRSVDWORD -Wno-MULTIDRIVEN
 
 
 ##################################################################################
