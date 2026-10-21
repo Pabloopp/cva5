@@ -1,6 +1,11 @@
 package capability_types;
 
+  // Override the package-wide source width for unit-test configurations.
+`ifdef GCT_NUM_CORES
+  parameter int unsigned NUM_CORES = `GCT_NUM_CORES;
+`else
   parameter int unsigned NUM_CORES = 1;
+`endif
   parameter int unsigned GCT_ENTRIES = 128;
   parameter int unsigned GCT_FIFO_DEPTH = 8;
   parameter int unsigned PID_W = 8;
