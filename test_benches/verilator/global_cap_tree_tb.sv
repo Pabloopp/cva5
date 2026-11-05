@@ -1,9 +1,32 @@
+
 import capability_types::*;
 
 module tb_global_cap_tree;
 
   logic clk;
   logic rst;
+`ifdef GCT_TB_FAULT_INJECT
+  logic tb_fault_write = 0;
+  logic [CAP_IDX_W-1:0] tb_fault_idx = '0;
+  gct_entry_t tb_fault_entry = '0;
+`endif
+
+  // Each queued operation uses one EXEC cycle plus IDLE/RESP and frontend overhead.
+  localparam int REQUEST_TIMEOUT = 6 * (GCT_FIFO_DEPTH + 2 * NUM_CORES + 2);
+  localparam int WATCHDOG_CYCLES = 100 * GCT_ENTRIES * REQUEST_TIMEOUT;
+  int unsigned simulation_cycles = 0;
+  always @(posedge clk) begin
+    simulation_cycles = simulation_cycles + 1;
+    if (simulation_cycles > WATCHDOG_CYCLES) $fatal(1, "Global simulation watchdog expired");
+  end
+
+  task automatic wait_ready(input bit is_ceu, input int unsigned core_id);
+    for (int cycle = 0; cycle < REQUEST_TIMEOUT; cycle++) begin
+      @(negedge clk);
+      if (is_ceu ? ceu_ready[core_id] : lcc_ready[core_id]) return;
+    end
+    $fatal(1, "Timeout waiting for ready: core %0d CEU=%0b", core_id, is_ceu);
+  endtask
 
   // ------------------------------------------------------------
   // DUT interfaces
@@ -14,7 +37,7 @@ module tb_global_cap_tree;
   // ------------------------------------------------------------
   // Flat TB-side signals and arrays
   //
-  // Verilator compatibility:
+  // Interface-array compatibility:
   // Procedural code drives these plain arrays instead of indexing interface arrays.
   // The generate block below bridges them to the actual DUT interfaces.
   // ------------------------------------------------------------
@@ -39,6 +62,11 @@ module tb_global_cap_tree;
   global_cap_tree dut (
       .clk   (clk),
       .rst   (rst),
+`ifdef GCT_TB_FAULT_INJECT
+      .tb_fault_write(tb_fault_write),
+      .tb_fault_idx(tb_fault_idx),
+      .tb_fault_entry(tb_fault_entry),
+`endif
       .lcc_if(lcc_if),
       .ceu_if(ceu_if)
   );
@@ -118,9 +146,7 @@ module tb_global_cap_tree;
       $fatal(1, "[FAIL] LCC core_id %0d out of range", core_id);
     end
 
-    do begin
-      @(negedge clk);
-    end while (!lcc_ready[core_id]);
+    wait_ready(0, core_id);
 
     enqueue_expected(0, core_id, 0, gct_response_t'('0));
     lcc_request_drv[core_id] = req;
@@ -133,7 +159,7 @@ module tb_global_cap_tree;
 
     rsp = '0;
 
-    for (cycles = 0; cycles < 30; cycles++) begin
+    for (cycles = 0; cycles < REQUEST_TIMEOUT; cycles++) begin
       @(negedge clk);
 
       if (lcc_done[core_id]) begin
@@ -153,9 +179,7 @@ module tb_global_cap_tree;
       $fatal(1, "[FAIL] CEU core_id %0d out of range", core_id);
     end
 
-    do begin
-      @(negedge clk);
-    end while (!ceu_ready[core_id]);
+    wait_ready(1, core_id);
 
     enqueue_expected(1, core_id, 0, gct_response_t'('0));
     ceu_request_drv[core_id] = req;
@@ -168,7 +192,7 @@ module tb_global_cap_tree;
 
     rsp = '0;
 
-    for (cycles = 0; cycles < 30; cycles++) begin
+    for (cycles = 0; cycles < REQUEST_TIMEOUT; cycles++) begin
       @(negedge clk);
 
       if (ceu_done[core_id]) begin
@@ -228,11 +252,15 @@ module tb_global_cap_tree;
     bit check_payload;
     gct_response_t response;
   } expected_t;
+
   expected_t expected_responses[$];
   logic [2*NUM_CORES-1:0] previous_done;
   int unsigned accepted_count = 0;
   int unsigned response_count = 0;
   bit saw_full = 0;
+  int unsigned exec_cycles_since_response = 0;
+  int unsigned execution_count = 0;
+  int unsigned revoke_exec_cycles = 0;
 
   task automatic enqueue_expected(input bit is_ceu, input int unsigned core,
                                   input bit check_payload, input gct_response_t response);
@@ -245,10 +273,13 @@ module tb_global_cap_tree;
   // Global protocol and scoreboard monitor. Sampling here checks the values seen
   // by the DUT on the current rising edge, before non-blocking updates settle.
   always @(posedge clk) begin : monitor
-    expected_t item;
+    expected_t  item;
+    gct_entry_t expected_entry;
+    int target, end_idx;
 
     if (rst) begin
       previous_done = '0;
+      exec_cycles_since_response = 0;
     end else begin
       // Responses must target at most one requester and pulse for one cycle.
       if (!$onehot0({ceu_done, lcc_done})) $fatal(1, "Multiple response destinations");
@@ -280,10 +311,59 @@ module tb_global_cap_tree;
         end
       end
 
+      // Every operation, including errors, must execute exactly once before RESP.
+      if (dut.gct_state_q == GCT_EXEC) begin
+        exec_cycles_since_response++;
+        execution_count++;
+        if (exec_cycles_since_response != 1 || dut.gct_state_d != GCT_RESP)
+          $fatal(
+              1,
+              "Operation %0d did not use exactly one GCT_EXEC cycle",
+              dut.current_entry_q.request.op
+          );
+      end
+      if (dut.gct_state_q == GCT_RESP) begin
+        if (exec_cycles_since_response != 1) $fatal(1, "Response without exactly one EXEC");
+        exec_cycles_since_response = 0;
+      end
+      if (dut.gct_state_q == GCT_EXEC && dut.response_d.error == GCT_ERR_NONE) begin
+        target = int'(dut.current_entry_q.request.cap_idx);
+        if (dut.current_entry_q.request.op == GCT_OP_DELETE) begin
+          for (int i = 0; i < GCT_ENTRIES; i++) begin
+            expected_entry = dut.cap_table_q[i];
+            if (i == target) expected_entry.owner_pid = INVALID_PID;
+            if (dut.cap_table_d[i] !== expected_entry)
+              $fatal(1, "DELETE changed fields other than selected owner at %0d", i);
+          end
+        end
+        if (dut.current_entry_q.request.op == GCT_OP_REVOKE) begin
+          revoke_exec_cycles++;
+          end_idx = target + int'(dut.cap_table_q[target].csize);
+          for (int i = 0; i < GCT_ENTRIES; i++) begin
+            expected_entry = dut.cap_table_q[i];
+            if (i > target && i < end_idx) expected_entry.owner_pid = INVALID_PID;
+            if (i == target) expected_entry.cfree = expected_entry.csize;
+            if (dut.cap_table_d[i] !== expected_entry)
+              $fatal(1, "Parallel REVOKE table mismatch at %0d", i);
+          end
+          if (|{ceu_done, lcc_done} || dut.gct_req_fifo_if.pop)
+            $fatal(1, "Response or FIFO pop during REVOKE execution");
+        end
+      end
+      if (dut.gct_state_q == GCT_RESP &&
+          dut.current_entry_q.request.op == GCT_OP_REVOKE &&
+          dut.response_q.error == GCT_ERR_NONE) begin
+        target = int'(dut.current_entry_q.request.cap_idx);
+        if (dut.cap_table_q[target].owner_pid == INVALID_PID ||
+            dut.cap_table_q[target].cfree != dut.cap_table_q[target].csize)
+          $fatal(1, "Successful REVOKE response before complete reclamation");
+      end
+
       // Record FIFO saturation for the burst test.
       saw_full |= dut.gct_req_fifo_if.full;
 
-      // Every failed operation, LOOKUP, and non-execution cycle must preserve authority.
+      // An error cycle preserves the entire current table.
+      // LOOKUP and non-execution cycles also preserve authority.
       if (dut.gct_state_q != GCT_EXEC || dut.response_d.error != GCT_ERR_NONE ||
           dut.current_entry_q.request.op == GCT_OP_LOOKUP) begin
         for (int i = 0; i < GCT_ENTRIES; i++)
@@ -295,7 +375,7 @@ module tb_global_cap_tree;
 
   // Wait until every accepted request has produced exactly one response.
   task automatic drain_responses();
-    for (int cycle = 0; cycle < 300; cycle++) begin
+    for (int cycle = 0; cycle < REQUEST_TIMEOUT; cycle++) begin
       @(negedge clk);
       if (expected_responses.size() == 0) begin
         repeat (8) @(negedge clk);
@@ -387,15 +467,6 @@ module tb_global_cap_tree;
     expect_error("descendant survives parent delete", rsp, GCT_ERR_NONE);
     expect_metadata("surviving descendant", rsp.metadata, PID_W'(7), ADDR_W'('h5000), ADDR_W'('h10),
                     R_PERM);
-
-    // ----------------------------------------------------------
-    // 8. Unsupported operation: REVOKE currently not implemented
-    // ----------------------------------------------------------
-    // TODO: replace this expectation with functional revoke tests once REVOKE is implemented.
-
-    issue_ceu_req(0, make_req(GCT_OP_REVOKE, ROOT_OWNER_PID, '0), rsp);
-
-    expect_error("unsupported revoke", rsp, GCT_ERR_OP);
 
     // ----------------------------------------------------------
     // 9. Check every three-bit permission combination
@@ -525,7 +596,7 @@ module tb_global_cap_tree;
     bad.error = GCT_ERR_OWNER;
     saw_full  = 0;
     for (int n = 0; n < 24; n++) begin
-      do @(negedge clk); while (!lcc_ready[core1]);
+      wait_ready(0, core1);
       enqueue_expected(0, core1, 1, (n % 2 == 0) ? good : bad);
       lcc_request_drv[core1] =
           make_req(GCT_OP_LOOKUP, (n % 2 == 0) ? ROOT_OWNER_PID : PID_W'(99), '0);
@@ -767,6 +838,306 @@ module tb_global_cap_tree;
 
   endtask
 
+  // Check the entire table, including preserved metadata in invalidated entries.
+  task automatic revoke_checked(input int idx, input logic [PID_W-1:0] owner, input string name);
+    gct_entry_t expected_table[GCT_ENTRIES];
+    gct_response_t rsp;
+    int end_idx, cycles_before;
+
+    drain_responses();
+    end_idx = idx + int'(dut.cap_table_q[idx].csize);
+    for (int i = 0; i < GCT_ENTRIES; i++) begin
+      expected_table[i] = dut.cap_table_q[i];
+      if (i > idx && i < end_idx) expected_table[i].owner_pid = INVALID_PID;
+      if (i == idx) expected_table[i].cfree = expected_table[i].csize;
+    end
+    cycles_before = int'(revoke_exec_cycles);
+    issue_ceu_req(0, make_req(GCT_OP_REVOKE, owner, CAP_IDX_W'(idx)), rsp);
+    expect_error(name, rsp, GCT_ERR_NONE);
+    drain_responses();
+    if (int'(revoke_exec_cycles) - cycles_before != 1)
+      $fatal(
+          1,
+          "%s: expected one execution cycle, got %0d",
+          name,
+          int'(revoke_exec_cycles) - cycles_before
+      );
+    for (int i = 0; i < GCT_ENTRIES; i++)
+      if (dut.cap_table_q[i] !== expected_table[i])
+        $fatal(1, "%s: final table mismatch at %0d", name, i);
+  endtask
+
+  task automatic derive_test(input int parent, input logic [PID_W-1:0] owner,
+                             input logic [PID_W-1:0] child_owner, input int reservation,
+                             output int child);
+    gct_request_t req;
+    gct_response_t rsp;
+    gct_entry_t entry;
+
+    child = parent + int'(dut.cap_table_q[parent].cfree) - reservation;
+    req = make_req(GCT_OP_DERIVE, owner, CAP_IDX_W'(parent));
+    req.child_owner_pid = child_owner;
+    req.child_base = ADDR_W'('h1000);
+    req.child_size = ADDR_W'('h100);
+    req.child_permissions = R_PERM;
+    req.child_csize = CSIZE_W'(reservation);
+    issue_ceu_req(0, req, rsp);
+    expect_error("revoke setup/reuse derive", rsp, GCT_ERR_NONE);
+    expect_child_idx("deterministic allocation", rsp.child_idx, CAP_IDX_W'(child));
+    expect_metadata("derived metadata", rsp.metadata, child_owner, req.child_base, req.child_size,
+                    R_PERM);
+    entry = '{
+        child_owner,
+        req.child_base,
+        req.child_size,
+        R_PERM,
+        CSIZE_W'(reservation),
+        CSIZE_W'(reservation)
+    };
+    if (dut.cap_table_q[child] !== entry) $fatal(1, "Derived table metadata mismatch");
+  endtask
+
+  task automatic unchanged_error(input gct_request_t req, input gct_error_t error,
+                                 input string name);
+    gct_entry_t saved[GCT_ENTRIES];
+    gct_response_t rsp;
+    drain_responses();
+    for (int i = 0; i < GCT_ENTRIES; i++) saved[i] = dut.cap_table_q[i];
+    issue_ceu_req(0, req, rsp);
+    expect_error(name, rsp, error);
+    drain_responses();
+    for (int i = 0; i < GCT_ENTRIES; i++)
+      if (dut.cap_table_q[i] !== saved[i]) $fatal(1, "%s modified index %0d", name, i);
+  endtask
+
+  task automatic run_revoke_tests();
+    int a, b, c, d, sibling, reused;
+    gct_entry_t deleted, root_before;
+    gct_response_t rsp;
+
+    // Reclaim the earlier suites' mixed live/deleted hierarchy without resetting it.
+    revoke_checked(0, ROOT_OWNER_PID, "root revoke after legacy suites");
+    derive_test(0, ROOT_OWNER_PID, PID_W'(9), 4, sibling);
+    derive_test(0, ROOT_OWNER_PID, PID_W'(2), 16, a);
+    derive_test(a, PID_W'(2), PID_W'(3), 8, b);
+    root_before = dut.cap_table_q[0];
+    revoke_checked(b, PID_W'(3), "A: revoke leaf with reserved free space");
+    revoke_checked(a, PID_W'(2), "B: revoke one child");
+    if (dut.cap_table_q[0] !== root_before) $fatal(1, "Non-root revoke changed root");
+    issue_lcc_req(0, make_req(GCT_OP_LOOKUP, PID_W'(3), CAP_IDX_W'(b)), rsp);
+    expect_error("lookup revoked child", rsp, GCT_ERR_INVALID);
+
+    // Allocations grow downwards: B=A+8, C=B+6, D=A+6, not A/B/C/D order.
+    derive_test(a, PID_W'(2), PID_W'(3), 8, b);
+    derive_test(b, PID_W'(3), PID_W'(4), 2, c);
+    derive_test(a, PID_W'(2), PID_W'(5), 2, d);
+    if (b != a + 8 || c != b + 6 || d != a + 6) $fatal(1, "Unexpected multi-generation layout");
+    revoke_checked(a, PID_W'(2), "C: revoke multiple generations and siblings");
+    revoke_checked(a, PID_W'(2), "F: repeated revoke is a no-op");
+
+    derive_test(a, PID_W'(2), PID_W'(3), 8, reused);
+    if (reused != b) $fatal(1, "E: reclaimed slot was not reused");
+    derive_test(b, PID_W'(3), PID_W'(4), 2, c);
+    deleted = dut.cap_table_q[b];
+    issue_ceu_req(0, make_req(GCT_OP_DELETE, PID_W'(3), CAP_IDX_W'(b)), rsp);
+    expect_error("D: delete intermediate capability", rsp, GCT_ERR_NONE);
+    deleted.owner_pid = INVALID_PID;
+    if (dut.cap_table_q[b] !== deleted || dut.cap_table_q[c].owner_pid != PID_W'(4))
+      $fatal(1, "DELETE changed metadata or invalidated descendant");
+    unchanged_error(make_req(GCT_OP_REVOKE, PID_W'(3), CAP_IDX_W'(b)), GCT_ERR_INVALID,
+                    "H: revoke deleted target");
+    unchanged_error(make_req(GCT_OP_REVOKE, PID_W'(99), CAP_IDX_W'(a)), GCT_ERR_OWNER,
+                    "H: revoke wrong owner");
+    // All 7-bit indices address the current 128-entry table. Use an unallocated slot.
+    unchanged_error(make_req(GCT_OP_REVOKE, ROOT_OWNER_PID, CAP_IDX_W'(1)), GCT_ERR_INVALID,
+                    "H: revoke invalid slot");
+    revoke_checked(a, PID_W'(2), "D: revoke live C beneath deleted B");
+    derive_test(a, PID_W'(2), PID_W'(6), 8, reused);
+    if (reused != b) $fatal(1, "E: reuse after deleted intermediate failed");
+    derive_test(reused, PID_W'(6), PID_W'(7), 2, c);
+    revoke_checked(0, ROOT_OWNER_PID, "G: root revoke mixed owners and nested descendants");
+    if (dut.cap_table_q[0] !== ROOT_CAPABILITY) $fatal(1, "Root authority changed");
+  endtask
+
+  task automatic run_large_subtree_test();
+    int a, child, reused, cycles_before;
+    int unsigned core1;
+    gct_response_t revoke_rsp, lookup_rsp, expected_lookup;
+    gct_entry_t root_before;
+
+    // Reserve nearly the entire table and populate it with 125 live descendants.
+    derive_test(0, ROOT_OWNER_PID, PID_W'(2), GCT_ENTRIES - 1, a);
+    for (int n = 0; n < GCT_ENTRIES - 3; n++) derive_test(a, PID_W'(2), PID_W'(3), 1, child);
+
+    root_before = dut.cap_table_q[0];
+    drain_responses();
+    cycles_before = int'(revoke_exec_cycles);
+
+    if (NUM_CORES < 2) begin
+      revoke_checked(a, PID_W'(2), "large subtree invalidated in one execution cycle");
+    end else begin
+      core1 = 1;
+      // Submit an LCC lookup at the clock edge that executes REVOKE.
+      // It must execute afterwards and observe the invalidated capability.
+      fork
+        begin
+          issue_ceu_req(0, make_req(GCT_OP_REVOKE, PID_W'(2), CAP_IDX_W'(a)), revoke_rsp);
+          expect_error("large multicore revoke", revoke_rsp, GCT_ERR_NONE);
+        end
+        begin
+          bit started;
+          started = 0;
+          for (int cycle = 0; cycle < REQUEST_TIMEOUT; cycle++) begin
+            @(negedge clk);
+            if (dut.gct_state_q == GCT_EXEC &&
+                dut.current_entry_q.request.op == GCT_OP_REVOKE) begin
+              started = 1;
+              break;
+            end
+          end
+          if (!started) $fatal(1, "Large REVOKE never entered GCT_EXEC");
+          if (!lcc_ready[core1]) $fatal(1, "Concurrent LCC interface not ready");
+
+          expected_lookup = '0;
+          expected_lookup.error = GCT_ERR_INVALID;
+          enqueue_expected(0, core1, 1, expected_lookup);
+          lcc_request_drv[core1] = make_req(GCT_OP_LOOKUP, PID_W'(3), CAP_IDX_W'(a + 2));
+          lcc_new_request[core1] = 1'b1;
+          @(negedge clk);
+          lcc_new_request[core1] = 1'b0;
+          lcc_request_drv[core1] = '0;
+        end
+      join
+      drain_responses();
+    end
+
+    if (int'(revoke_exec_cycles) - cycles_before != 1)
+      $fatal(1, "Large REVOKE did not finish in exactly one execution cycle");
+    if (dut.cap_table_q[0] !== root_before ||
+        dut.cap_table_q[a].owner_pid != PID_W'(2) ||
+        dut.cap_table_q[a].cfree != dut.cap_table_q[a].csize)
+      $fatal(1, "Large REVOKE modified its target or ancestor incorrectly");
+    for (int i = a + 1; i < GCT_ENTRIES; i++)
+      if (dut.cap_table_q[i].owner_pid != INVALID_PID)
+        $fatal(1, "Large REVOKE missed descendant %0d", i);
+
+    // Verify that reclaimed space can be reused without changing the root.
+    derive_test(a, PID_W'(2), PID_W'(6), 1, reused);
+    if (reused != GCT_ENTRIES - 1 || dut.cap_table_q[0] !== root_before ||
+        dut.cap_table_q[a].cfree != CSIZE_W'(GCT_ENTRIES - 2))
+      $fatal(1, "Post-revocation allocation state mismatch");
+    for (int i = a + 1; i < GCT_ENTRIES - 1; i++)
+      if (dut.cap_table_q[i].owner_pid != INVALID_PID)
+        $fatal(1, "Reused allocation unexpectedly revalidated entry %0d", i);
+    issue_lcc_req(0, make_req(GCT_OP_LOOKUP, PID_W'(6), CAP_IDX_W'(reused)), lookup_rsp);
+    expect_error("lookup reused descendant", lookup_rsp, GCT_ERR_NONE);
+    expect_metadata("reused descendant", lookup_rsp.metadata, PID_W'(6), ADDR_W'('h1000),
+                    ADDR_W'('h100), R_PERM);
+    $display("[PASS] single-cycle large revoke, optional concurrent lookup, and reuse");
+  endtask
+
+`ifdef GCT_TB_FAULT_INJECT
+  // Fault tests use a clocked test-only input, isolated by full resets.
+  task automatic inject_entry(input int idx, input gct_entry_t entry);
+    @(negedge clk);
+    if (rst || dut.gct_state_q != GCT_IDLE || dut.gct_req_fifo_if.valid ||
+        |dut.ceu_pending_valid_q || |dut.lcc_pending_valid_q ||
+        |ceu_new_request || |lcc_new_request || expected_responses.size() != 0)
+      $fatal(1, "Fault injection requires an idle engine and empty request queues");
+    tb_fault_idx   = CAP_IDX_W'(idx);
+    tb_fault_entry = entry;
+    tb_fault_write = 1;
+    @(negedge clk);
+    tb_fault_write = 0;
+    if (dut.cap_table_q[idx] !== entry) $fatal(1, "Clocked fault injection failed");
+  endtask
+
+  task automatic reset_clean();
+    drain_responses();
+    @(negedge clk);
+    rst = 1;
+    clear_all_drivers();
+    repeat (3) @(negedge clk);
+    rst = 0;
+    repeat (2) @(negedge clk);
+    if (dut.cap_table_q[0] !== ROOT_CAPABILITY) $fatal(1, "Fault-test reset failed");
+    for (int i = 1; i < GCT_ENTRIES; i++)
+      if (dut.cap_table_q[i] !== gct_entry_t'('0)) $fatal(1, "Fault-test reset residue");
+  endtask
+
+  task automatic run_bad_revoke_tests();
+    gct_entry_t target, child_entry;
+    int idx;
+
+    // Only zero csize and an out-of-table subtree are rejected by REVOKE.
+    for (int fault = 0; fault < 4; fault++) begin
+      reset_clean();
+      target = ROOT_CAPABILITY;
+      target.csize = CSIZE_W'(8);
+      target.cfree = CSIZE_W'(4);
+      idx = 1;
+      case (fault)
+        0: target.csize = '0;
+        1: begin
+          idx = GCT_ENTRIES - 1;
+          target.csize = CSIZE_W'(GCT_ENTRIES);
+        end
+        // An apparently empty subtree can still extend outside the table.
+        2: begin
+          idx = GCT_ENTRIES - 1;
+          target.cfree = target.csize;
+        end
+        // The 9-bit end-index arithmetic must detect 127 + 255 > 128.
+        3: begin
+          idx = GCT_ENTRIES - 1;
+          target.csize = '1;
+          target.cfree = target.csize;
+        end
+        default: $fatal(1, "Unknown fault case");
+      endcase
+      inject_entry(idx, target);
+      unchanged_error(make_req(GCT_OP_REVOKE, ROOT_OWNER_PID, CAP_IDX_W'(idx)), GCT_ERR_BAD_ARG,
+                      $sformatf("REVOKE invalid interval case %0d", fault));
+    end
+
+    // REVOKE does not consult the target's cfree to find its descendants.
+    // These injected cfree values are inconsistent, but revocation succeeds.
+    for (int fault = 0; fault < 2; fault++) begin
+      reset_clean();
+      target = ROOT_CAPABILITY;
+      target.csize = CSIZE_W'(8);
+      target.cfree = (fault == 0) ? '0 : CSIZE_W'(9);
+      inject_entry(1, target);
+      revoke_checked(1, ROOT_OWNER_PID, $sformatf("REVOKE ignores target cfree case %0d", fault));
+    end
+
+    // Descendant metadata is preserved and never consulted for traversal.
+    for (int fault = 0; fault < 3; fault++) begin
+      reset_clean();
+      target = ROOT_CAPABILITY;
+      target.csize = CSIZE_W'(8);
+      target.cfree = CSIZE_W'(4);
+      child_entry = ROOT_CAPABILITY;
+      child_entry.csize = CSIZE_W'(4);
+      child_entry.cfree = (fault == 0) ? '0 : ((fault == 1) ? CSIZE_W'(5) : '1);
+      inject_entry(1, target);
+      inject_entry(5, child_entry);
+      revoke_checked(1, ROOT_OWNER_PID, $sformatf("REVOKE ignores descendant cfree case %0d", fault
+                     ));
+    end
+
+    // Last index: a one-entry subtree has no descendants and end == GCT_ENTRIES.
+    reset_clean();
+    target = ROOT_CAPABILITY;
+    target.csize = CSIZE_W'(1);
+    target.cfree = CSIZE_W'(1);
+    inject_entry(GCT_ENTRIES - 1, target);
+    revoke_checked(GCT_ENTRIES - 1, ROOT_OWNER_PID, "last-index empty subtree");
+    reset_clean();
+  endtask
+
+`endif
+
   // ------------------------------------------------------------
   // Testbench entry point
   // ------------------------------------------------------------
@@ -793,6 +1164,20 @@ module tb_global_cap_tree;
 
     run_edge_tests();
     drain_responses();
+
+    run_revoke_tests();
+    run_large_subtree_test();
+`ifdef GCT_TB_FAULT_INJECT
+    run_bad_revoke_tests();
+`else
+    $display("[SKIP] metadata fault tests (enable GCT_TB_FAULT_INJECT)");
+`endif
+    drain_responses();
+    if (execution_count != response_count) $fatal(1, "Execution/response count mismatch");
+    $display("[PASS] every operation used exactly one GCT_EXEC cycle (%0d operations)",
+             execution_count);
+    $display("[PASS] response conservation: accepted=%0d responses=%0d", accepted_count,
+             response_count);
 
     $display("========================================");
     $display("All GCT tests passed");

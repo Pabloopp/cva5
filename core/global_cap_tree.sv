@@ -1,8 +1,15 @@
+
 import capability_types::*;
 
 module global_cap_tree (
     input logic clk,
     input logic rst,
+`ifdef GCT_TB_FAULT_INJECT
+    // Unit-test builds only: load malformed metadata through the sole register writer.
+    input logic tb_fault_write,
+    input logic [CAP_IDX_W-1:0] tb_fault_idx,
+    input gct_entry_t tb_fault_entry,
+`endif
 
     // One GCT interface per core.
     global_cap_tree_interface.gct lcc_if[NUM_CORES],
@@ -67,6 +74,9 @@ module global_cap_tree (
 
   logic [ADDR_W-1:0] derive_child_end;
   logic [ADDR_W-1:0] derive_parent_end;
+
+  // Widen the exclusive subtree end so index + csize cannot wrap.
+  logic [CSIZE_W:0] revoke_end_idx_ext;
 
   // Response
   gct_response_t response_d;
@@ -210,6 +220,10 @@ module global_cap_tree (
 
     derive_parent_end = derive_parent_entry.base + derive_parent_entry.size;
 
+    revoke_end_idx_ext =
+        {1'b0, CSIZE_W'(current_entry_q.request.cap_idx)} +
+        {1'b0, cap_table_q[current_entry_q.request.cap_idx].csize};
+
     case (gct_state_q)
 
       GCT_IDLE: begin
@@ -224,9 +238,10 @@ module global_cap_tree (
         gct_state_d = GCT_RESP;
 
         // Common capability checks
-        if (derive_parent_entry.owner_pid == INVALID_PID) begin
+        if (cap_table_q[current_entry_q.request.cap_idx].owner_pid == INVALID_PID) begin
           response_d.error = GCT_ERR_INVALID;
-        end else if (derive_parent_entry.owner_pid != current_entry_q.request.caller_pid) begin
+        end else if (cap_table_q[current_entry_q.request.cap_idx].owner_pid !=
+                     current_entry_q.request.caller_pid) begin
           response_d.error = GCT_ERR_OWNER;
         end else begin
           response_d.error = GCT_ERR_NONE;
@@ -236,7 +251,8 @@ module global_cap_tree (
 
           GCT_OP_LOOKUP: begin
             if (response_d.error == GCT_ERR_NONE) begin
-              response_d.metadata = entry_to_metadata(derive_parent_entry);
+              response_d.metadata =
+                  entry_to_metadata(cap_table_q[current_entry_q.request.cap_idx]);
             end
           end
 
@@ -304,11 +320,28 @@ module global_cap_tree (
               if (current_entry_q.request.cap_idx == '0) begin
                 response_d.error = GCT_ERR_BAD_ARG;
               end else begin
-                cap_table_d[current_entry_q.request.cap_idx] = '0;
+                cap_table_d[current_entry_q.request.cap_idx].owner_pid = INVALID_PID;
               end
             end
           end
-          // GCT_OP_REVOKE: ...
+          GCT_OP_REVOKE: begin
+            if (response_d.error == GCT_ERR_NONE) begin
+              if ((cap_table_q[current_entry_q.request.cap_idx].csize == '0) ||
+                  (int'(revoke_end_idx_ext) > GCT_ENTRIES)) begin
+                response_d.error = GCT_ERR_BAD_ARG;
+              end else begin
+                // Invalidate the entire reserved interval in parallel
+                for (int unsigned i = 0; i < GCT_ENTRIES; i++) begin
+                  if ((i > current_entry_q.request.cap_idx) &&
+                      (i < revoke_end_idx_ext)) begin
+                    cap_table_d[i].owner_pid = INVALID_PID;
+                  end
+                end
+                cap_table_d[current_entry_q.request.cap_idx].cfree =
+                    cap_table_q[current_entry_q.request.cap_idx].csize;
+              end
+            end
+          end
 
           default: begin
             response_d.error = GCT_ERR_OP;
@@ -350,6 +383,10 @@ module global_cap_tree (
           end else begin
             cap_table_q[i] <= '0;
           end
+`ifdef GCT_TB_FAULT_INJECT
+        end else if (tb_fault_write && tb_fault_idx == CAP_IDX_W'(i)) begin
+          cap_table_q[i] <= tb_fault_entry;
+`endif
         end else begin
           cap_table_q[i] <= cap_table_d[i];
         end
@@ -358,15 +395,3 @@ module global_cap_tree (
     end
   endgenerate
 endmodule
-
-
-
-
-
-
-
-
-
-
-
-
