@@ -2,17 +2,19 @@ package capability_types;
 
   // Override the package-wide source width for unit-test configurations.
 `ifdef GCT_NUM_CORES
-  parameter int unsigned NUM_CORES = `GCT_NUM_CORES;
+  localparam int unsigned NUM_CORES = `GCT_NUM_CORES;
 `else
-  parameter int unsigned NUM_CORES = 1;
+  localparam int unsigned NUM_CORES = 1;
 `endif
-  parameter int unsigned GCT_ENTRIES = 128;
-  parameter int unsigned GCT_FIFO_DEPTH = 8;
-  parameter int unsigned PID_W = 8;
-  parameter int unsigned ADDR_W = 32;
-  parameter int unsigned PERM_W = 3;  // {X, W, R}
+  localparam int unsigned GCT_ENTRIES = 128;
+  localparam int unsigned GCT_FIFO_DEPTH = 8;
+  localparam int unsigned PID_W = 8;
+  localparam int unsigned ADDR_W = 32;
+  localparam int unsigned PERM_W = 3;  // {X, W, R}
   localparam int unsigned CAP_IDX_W = (GCT_ENTRIES <= 2) ? 1 : $clog2(GCT_ENTRIES);
   localparam int unsigned CSIZE_W = (GCT_ENTRIES <= 2) ? 1 : $clog2(GCT_ENTRIES + 1);
+  localparam int unsigned LCC_ENTRIES = 8;
+  localparam int unsigned LCC_IDX_W = $clog2(LCC_ENTRIES);
   localparam logic [PERM_W-1:0] PERM_NONE = 3'b000;
   localparam logic [PERM_W-1:0] R_PERM = 3'b001;
   localparam logic [PERM_W-1:0] W_PERM = 3'b010;
@@ -102,9 +104,19 @@ package capability_types;
     GCT_IDLE,
     GCT_EXEC,
     GCT_RESP
-
   } gct_state_t;
 
+  typedef struct packed {
+    logic [CAP_IDX_W-1:0] cap_idx;
+    cap_metadata_t        metadata;
+    logic                 valid;
+  } lcc_entry_t;
+
+  typedef enum logic [1:0] {
+    LCC_IDLE,
+    LCC_SEND_GCT,
+    LCC_WAIT_GCT
+  } lcc_state_t;
 endpackage
 
 

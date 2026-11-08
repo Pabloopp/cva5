@@ -477,3 +477,40 @@ interface global_cap_tree_interface;
   modport gct(input new_request, input request, output ready, output done, output response);
 
 endinterface
+
+interface local_cap_cache_interface;
+
+  import capability_types::*;
+
+  logic                          request;
+  logic          [CAP_IDX_W-1:0] cap_idx;
+  logic          [    PID_W-1:0] caller_pid;
+  logic                          flush;
+
+  logic                          hit;
+  gct_error_t                    error;
+  cap_metadata_t                 metadata;
+
+  // Used by the Capability Enforcement Unit.
+  modport ceu(
+      input hit,
+      input error,
+      input metadata,
+      output request,
+      output cap_idx,
+      output caller_pid,
+      output flush
+  );
+
+  // Used by the Local Capability Cache.
+  modport lcc(
+      input request,
+      input cap_idx,
+      input caller_pid,
+      input flush,
+      output hit,
+      output error,
+      output metadata
+  );
+
+endinterface
