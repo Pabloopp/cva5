@@ -482,35 +482,48 @@ interface local_cap_cache_interface;
 
   import capability_types::*;
 
-  logic                          request;
-  logic          [CAP_IDX_W-1:0] cap_idx;
-  logic          [    PID_W-1:0] caller_pid;
-  logic                          flush;
+  logic                 request;
+  logic [CAP_IDX_W-1:0] cap_idx;
+  logic [PID_W-1:0]     caller_pid;
+  logic                 flush;
 
-  logic                          hit;
-  gct_error_t                    error;
-  cap_metadata_t                 metadata;
+  logic          hit;
+  gct_error_t    error;
+  cap_metadata_t metadata;
 
   // Used by the Capability Enforcement Unit.
-  modport ceu(
-      input hit,
-      input error,
-      input metadata,
-      output request,
-      output cap_idx,
-      output caller_pid,
-      output flush
-  );
+  modport ceu(input hit, input error, input metadata, output request,
+              output cap_idx, output caller_pid, output flush);
 
   // Used by the Local Capability Cache.
-  modport lcc(
-      input request,
-      input cap_idx,
-      input caller_pid,
-      input flush,
-      output hit,
-      output error,
-      output metadata
+  modport lcc(input request, input cap_idx, input caller_pid, input flush,
+              output hit, output error, output metadata);
+
+endinterface
+
+interface cap_enforcement_unit_interface;
+
+  import capability_types::*;
+
+  // Request
+  logic          request_valid;
+  ceu_request_t  request;
+  logic          cancel;
+
+  // Response
+  logic          result_valid;
+  ceu_response_t response;
+  logic          result_ack;
+
+  modport ceu (
+      input  request_valid, request, cancel, result_ack,
+      output result_valid, response
+  );
+
+  modport pipeline (
+      output request_valid, request, cancel, result_ack,
+      input  result_valid, response
   );
 
 endinterface
+

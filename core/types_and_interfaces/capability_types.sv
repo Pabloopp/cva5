@@ -29,11 +29,10 @@ package capability_types;
 
 
   typedef enum logic [2:0] {
-    GCT_OP_LOOKUP  = 3'd0,
-    GCT_OP_PRELOAD = 3'd1,
-    GCT_OP_DERIVE  = 3'd2,
-    GCT_OP_DELETE  = 3'd3,
-    GCT_OP_REVOKE  = 3'd4
+    GCT_OP_LOOKUP = 3'd0,
+    GCT_OP_DERIVE = 3'd2,
+    GCT_OP_DELETE = 3'd3,
+    GCT_OP_REVOKE = 3'd4
   } gct_op_t;
 
   typedef enum logic [3:0] {
@@ -117,6 +116,41 @@ package capability_types;
     LCC_SEND_GCT,
     LCC_WAIT_GCT
   } lcc_state_t;
+
+  typedef enum logic [1:0] {
+    CEU_OP_ACCESS,
+    CEU_OP_GCT,
+    CEU_OP_SYNC
+  } ceu_op_t;
+
+  typedef struct packed {
+    logic [CAP_IDX_W-1:0] cap_idx;
+    logic [PID_W-1:0]     caller_pid;
+    logic [ADDR_W-1:0]    address;
+    logic [3:0]           access_size;
+    logic                 is_store;
+  } ceu_access_t;
+
+  typedef struct packed {
+    ceu_op_t             op;
+    ceu_access_t access;
+    gct_request_t        gct;
+  } ceu_request_t;
+
+  typedef enum logic [2:0] {
+    CEU_IDLE,
+    CEU_WAIT_LCC,
+    CEU_GCT_SEND,
+    CEU_GCT_WAIT,
+    CEU_RESPONSE,
+    CEU_DRAIN
+  } ceu_state_t;
+
+  typedef struct packed {
+    gct_error_t           error;
+    logic [CAP_IDX_W-1:0] child_idx;
+  } ceu_response_t;
+
 endpackage
 
 
